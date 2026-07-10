@@ -1,0 +1,3 @@
+aiohttp==3.11.13
+confluent-kafka==2.8.2
+prometheus-client==0.21.1
