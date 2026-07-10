@@ -49,7 +49,9 @@ services:
       - >-
         rpk topic create wiki.recentchange --brokers=redpanda:9092 --partitions=6 --replicas=1 ||
         true;
-        rpk topic alter-config wiki.recentchange --brokers=redpanda:9092 -s retention.ms=604800000
+        rpk topic alter-config wiki.recentchange --brokers=redpanda:9092 -s retention.ms=86400000;
+        rpk topic create wiki.recentchange.dlq --brokers=redpanda:9092 --partitions=1 --replicas=1 ||
+        true
     mem_limit: 128m
     cpus: 0.25
 
@@ -90,18 +92,28 @@ services:
   iceberg-rest:
     image: apache/iceberg-rest-fixture:1.8.1
     container_name: wiki-iceberg-rest
+    # image user `iceberg` can't write the named volume for the sqlite file;
+    # root is acceptable for a local-only fixture
+    user: "0:0"
     depends_on:
       minio-init:
         condition: service_completed_successfully
     environment:
+      # default is in-memory sqlite, which evaporates when the connection
+      # pool idles and 500s every request after — use a file on a volume
+      CATALOG_URI: jdbc:sqlite:file:/catalog/catalog.db
       CATALOG_WAREHOUSE: s3://warehouse/
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
       CATALOG_S3_ENDPOINT: http://minio:9000
+      # without path-style the SDK resolves bucket.minio virtual-host DNS, which fails
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
     ports:
       - "8181:8181"
+    volumes:
+      - catalog-data:/catalog
     mem_limit: 768m
     cpus: 0.75
     healthcheck:
@@ -137,13 +149,68 @@ services:
       retries: 12
       start_period: 10s
 
+  spark:
+    profiles: ["spark"]
+    build:
+      context: ./spark
+    container_name: wiki-spark
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+      iceberg-rest:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      SPARK_DRIVER_MEMORY: 1g
+      SPARK_EXECUTOR_MEMORY: 1g
+    # Keep this a single-element list. The shell entrypoint deliberately owns
+    # splitting; compose otherwise shlex-splits bare command strings.
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - >-
+        /opt/spark/bin/spark-submit
+        --master local[2]
+        --conf spark.driver.memory=1g
+        --conf spark.executor.memory=1g
+        --conf spark.sql.shuffle.partitions=6
+        --conf spark.jars.ivy=/tmp/.ivy2
+        --conf spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.8.1,org.apache.iceberg:iceberg-aws-bundle:1.8.1,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5
+        --conf spark.sql.catalog.local=org.apache.iceberg.spark.SparkCatalog
+        --conf spark.sql.catalog.local.catalog-impl=org.apache.iceberg.rest.RESTCatalog
+        --conf spark.sql.catalog.local.uri=http://iceberg-rest:8181
+        --conf spark.sql.catalog.local.warehouse=s3://warehouse/
+        --conf spark.sql.catalog.local.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+        --conf spark.sql.catalog.local.s3.endpoint=http://minio:9000
+        --conf spark.sql.catalog.local.s3.path-style-access=true
+        --conf spark.sql.catalog.local.s3.access-key-id=minioadmin
+        --conf spark.sql.catalog.local.s3.secret-access-key=minioadmin
+        --conf spark.sql.catalog.local.s3.region=us-east-1
+        /opt/spark/app/wiki_stream.py
+    ports:
+      - "9109:9109"
+    volumes:
+      - spark-checkpoints:/opt/spark/checkpoints
+    mem_limit: 2g
+    cpus: 1.5
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"from urllib.request import urlopen; urlopen('http://localhost:9109/metrics', timeout=2)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 45s
+
   prometheus:
     image: prom/prometheus:v3.2.1
     container_name: wiki-prometheus
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
-      - --storage.tsdb.retention.time=7d
+      - --storage.tsdb.retention.time=2d
     ports:
       - "9090:9090"
     volumes:
@@ -183,8 +250,10 @@ services:
       start_period: 15s
 
 volumes:
+  catalog-data:
   redpanda-data:
   minio-data:
   ingest-state:
   prometheus-data:
   grafana-data:
+  spark-checkpoints:

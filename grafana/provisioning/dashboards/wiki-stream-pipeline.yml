@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: wiki-stream-pipeline
+    orgId: 1
+    folder: Wiki Stream Pipeline
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
