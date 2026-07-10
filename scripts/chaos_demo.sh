@@ -42,8 +42,14 @@ docker compose --profile spark up -d spark >/dev/null 2>&1
 until [ "$(docker inspect -f '{{.State.Health.Status}}' wiki-spark)" = healthy ]; do sleep 3; done
 echo "spark is healthy again"
 
-say "Waiting two trigger intervals for catch-up"
-sleep 60
+say "Waiting for catch-up (backlog accumulated while processing was down)"
+for i in 1 2 3 4 5 6; do
+  sleep 30
+  f=$(curl -fsS localhost:9109/metrics | awk '$1=="spark_pipeline_freshness_seconds"{print int($2)}')
+  echo "  t+$((i*30))s: freshness=${f}s"
+  [ "$f" -lt 120 ] && break
+done
+sleep 45   # let a post-recovery snapshot commit so count growth is visible
 counts; freshness
 
 say "Duplicate check: bronze total rows vs distinct meta_id (must be equal)"
