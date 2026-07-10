@@ -25,7 +25,7 @@ SOURCE_TOPIC = "wiki.recentchange"
 DLQ_TOPIC = "wiki.recentchange.dlq"
 CHECKPOINT_ROOT = "/opt/spark/checkpoints"
 WATERMARK = "2 minutes"
-TRIGGER = "15 seconds"
+TRIGGER = "60 seconds"  # 15s caused batch pileup once state grew; see STATE.md Fri-night finding
 
 ROWS_WRITTEN = Counter(
     "spark_rows_written", "Rows successfully written by Spark", ["table"]
@@ -48,7 +48,7 @@ def build_spark() -> SparkSession:
     return (
         SparkSession.builder.appName("wiki-stream-pipeline")
         .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.sql.streaming.stateStore.providerClass", "org.apache.spark.sql.execution.streaming.state.HDFSBackedStateStoreProvider")
+        .config("spark.sql.streaming.stateStore.providerClass", "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider")
         .getOrCreate()
     )
 
@@ -273,6 +273,7 @@ def stream_to_iceberg(frame: DataFrame, table: str, checkpoint: str):
 
 def main() -> None:
     start_http_server(9109)
+    FRESHNESS.set(float("nan"))  # unset until first progress event; 0.0 default reads as fake-fresh
     start_freshness_updater()
     spark = build_spark()
     spark.streams.addListener(QueryMetricsListener())
