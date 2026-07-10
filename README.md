@@ -2,7 +2,9 @@
 
 Real-time pipeline over the live Wikimedia recent-changes firehose — **SSE → Redpanda → Spark Structured Streaming → Iceberg on MinIO → Grafana** — the whole thing runs on a laptop with one command.
 
-> 🚧 Built during a 3-day sprint, Jul 10–12 2026. See [STATE.md](STATE.md) for live progress.
+**Live write-up & interactive demo:** [portfolio-site-eosin-eta.vercel.app/projects/real-time-wikipedia-edits-pipeline](https://portfolio-site-eosin-eta.vercel.app/projects/real-time-wikipedia-edits-pipeline)
+
+![Grafana dashboard](docs/img/grafana-dashboard.png)
 
 ```mermaid
 flowchart LR
