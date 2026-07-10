@@ -141,11 +141,12 @@ class QueryMetricsListener(StreamingQueryListener):
         if sink_rows is None or int(sink_rows) < 0:
             sink_rows = progress.numInputRows
         row_count = max(0, int(sink_rows))
-        ROWS_WRITTEN.labels(table=query_name).inc(row_count)
-
-        if query_name == "dlq":
-            DLQ_RECORDS.inc(row_count)
-        elif query_name == "late_arrivals":
+        # dlq is foreachBatch: its sink reports -1 and numInputRows is the
+        # PRE-filter Kafka input, so counting here would show the whole
+        # stream as rejected. write_dlq counts its own actual writes.
+        if query_name != "dlq":
+            ROWS_WRITTEN.labels(table=query_name).inc(row_count)
+        if query_name == "late_arrivals":
             LATE_ARRIVALS.inc(row_count)
 
         event_time = progress.eventTime
@@ -248,7 +249,10 @@ def parsed_records(raw: DataFrame) -> tuple[DataFrame, DataFrame]:
 
 
 def write_dlq(batch: DataFrame, _: int) -> None:
-    """Write the DLQ at-least-once; its metrics come from the query listener."""
+    """Write the DLQ at-least-once and count the actual rejected rows."""
+    row_count = batch.count()
+    if not row_count:
+        return
     payload = batch.select(
         F.to_json(F.struct("reason", "raw_json", "ingested_at")).cast("string").alias("value")
     )
@@ -258,6 +262,8 @@ def write_dlq(batch: DataFrame, _: int) -> None:
         .option("topic", DLQ_TOPIC)
         .save()
     )
+    DLQ_RECORDS.inc(row_count)
+    ROWS_WRITTEN.labels(table="dlq").inc(row_count)
 
 
 def stream_to_iceberg(frame: DataFrame, table: str, checkpoint: str):
