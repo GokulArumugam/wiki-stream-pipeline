@@ -10,7 +10,7 @@ flowchart LR
 ```
 
 - **Architecture & decisions:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · ADRs in [docs/adr/](docs/adr/)
-- **Delivery semantics:** effectively-once into gold tables, stage-by-stage contract in [ADR-0005](docs/adr/0005-delivery-semantics.md)
+- **Delivery semantics:** native Iceberg streaming sinks make bronze and gold effectively-once on replay; the Kafka DLQ remains intentionally at-least-once. See the stage-by-stage contract in [ADR-0005](docs/adr/0005-delivery-semantics.md).
 
 ## Quickstart
 
@@ -34,4 +34,24 @@ make down  # stop the stack and retain data
 make nuke  # stop the stack and remove all named volumes
 ```
 
-Use `make spark-down` to stop only the opt-in Spark service while retaining its checkpoint. The Spark stage follows the blocking DQ, effectively-once, and 2-minute event-time watermark decisions in ADR-0003, ADR-0005, and ADR-0006.
+Use `make spark-down` to stop only the opt-in Spark service while retaining its checkpoint. The Spark stage follows the blocking DQ, effectively-once, and 2-minute event-time watermark decisions in ADR-0003, ADR-0005, and ADR-0006. Bronze and all gold tables use Iceberg's native streaming sink: a replayed `(queryId, epochId)` is deduplicated by the Iceberg snapshot commit protocol. The malformed-record DLQ deliberately stays on a `foreachBatch` Kafka writer, so it is at-least-once.
+
+## Iceberg maintenance
+
+After the base stack is running, run the batch maintenance job as needed:
+
+```sh
+make maintain
+```
+
+It discovers every table in the `bronze` and `gold` namespaces, expires snapshots older than 24 hours while retaining the newest five, removes orphan files older than 24 hours, and compacts small files with `rewrite_data_files`. The one-off Spark container has its own driver memory, so it does not contend with the streaming driver.
+
+## Website exports
+
+With the stack and Spark tables running, create website artifacts with:
+
+```sh
+make export
+```
+
+This writes each gold table and a 50,000-row bronze sample as one-data-file Parquet datasets under MinIO's `s3://warehouse/exports/` prefix, copies them to the ignored local `./exports/` directory, and writes `exports/sample_events.json` from 2,000 recent raw Redpanda events. Copy these artifacts into the portfolio-site repository; they are not committed here.

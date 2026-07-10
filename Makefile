@@ -4,16 +4,19 @@ COMPOSE := docker compose
 TOPIC := wiki.recentchange
 BROKER := redpanda:9092
 
-.PHONY: help up verify down nuke spark-up verify-spark spark-down
+.PHONY: help up verify down nuke spark-up verify-spark spark-down maintain export
 
 SPARK_PACKAGES := org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.8.1,org.apache.iceberg:iceberg-aws-bundle:1.8.1,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5
+# Kept in lockstep with the catalog settings in the compose Spark command.
 SPARK_CATALOG_CONF := --conf spark.jars.packages=$(SPARK_PACKAGES) --conf spark.sql.catalog.local=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.local.catalog-impl=org.apache.iceberg.rest.RESTCatalog --conf spark.sql.catalog.local.uri=http://iceberg-rest:8181 --conf spark.sql.catalog.local.warehouse=s3://warehouse/ --conf spark.sql.catalog.local.io-impl=org.apache.iceberg.aws.s3.S3FileIO --conf spark.sql.catalog.local.s3.endpoint=http://minio:9000 --conf spark.sql.catalog.local.s3.path-style-access=true --conf spark.sql.catalog.local.s3.access-key-id=minioadmin --conf spark.sql.catalog.local.s3.secret-access-key=minioadmin --conf spark.sql.catalog.local.s3.region=us-east-1
+# Iceberg CALL procedures (expire_snapshots etc.) need the SQL extensions
+SPARK_ONE_OFF := $(COMPOSE) --profile spark run --rm --no-deps --entrypoint /opt/spark/bin/spark-submit spark --master local[1] --conf spark.jars.ivy=/tmp/.ivy2 --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions $(SPARK_CATALOG_CONF)
 # Counts come from REST catalog snapshot summaries: a second spark-submit
 # inside the 2g streaming container OOM-kills the driver.
 SPARK_COUNT := python3 scripts/iceberg_counts.py
 
 help:
-	@printf '%s\n' 'Targets: up, verify, spark-up, verify-spark, spark-down, down, nuke'
+	@printf '%s\n' 'Targets: up, verify, spark-up, verify-spark, maintain, export, spark-down, down, nuke'
 
 up:
 	$(COMPOSE) up -d --build
@@ -95,6 +98,15 @@ verify-spark:
 		echo "FAIL: freshness must be numeric and below 300 seconds (got: $$freshness)"; exit 1; \
 	fi; \
 	echo "PASS: bronze $$first_bronze -> $$second_bronze; gold $$first_gold -> $$second_gold; freshness=$${freshness}s"
+
+maintain:
+	$(SPARK_ONE_OFF) /opt/spark/app/maintenance.py
+
+# Parquet is written straight to the bind mount; no S3A jars, no MinIO copy
+export:
+	mkdir -p exports
+	$(COMPOSE) --profile spark run --rm --no-deps -v "$$(pwd)/exports:/out" --entrypoint /opt/spark/bin/spark-submit spark --master local[1] --conf spark.jars.ivy=/tmp/.ivy2 $(SPARK_CATALOG_CONF) /opt/spark/app/export_data.py
+	$(COMPOSE) exec -T redpanda rpk topic consume wiki.recentchange --num 2000 -f '%v\n' > ./exports/sample_events.json
 
 spark-down:
 	$(COMPOSE) --profile spark stop spark

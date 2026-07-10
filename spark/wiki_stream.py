@@ -2,6 +2,8 @@
 
 Each sink owns a distinct checkpoint. Kafka offsets only advance after its
 Iceberg (or DLQ Kafka) write succeeds, so a failed micro-batch is replayed.
+The native Iceberg streaming sink records query and epoch metadata in snapshot
+summaries, making replayed Iceberg epochs effectively-once.
 """
 
 from __future__ import annotations
@@ -113,17 +115,52 @@ def start_freshness_updater() -> None:
 
 
 class QueryMetricsListener(StreamingQueryListener):
-    """Exports driver-side timing independently of the sink implementation."""
+    """Exports all per-query metrics from completed streaming-batch progress."""
 
     def onQueryStarted(self, event) -> None:  # noqa: N802 - Spark callback API
         return None
 
     def onQueryProgress(self, event) -> None:  # noqa: N802 - Spark callback API
+        global latest_event_time
         progress = event.progress
+        query_name = progress.name or progress.id
         duration_ms = progress.durationMs.get("triggerExecution", 0)
-        LAST_BATCH_DURATION.labels(query=progress.name or progress.id).set(
+        LAST_BATCH_DURATION.labels(query=query_name).set(
             float(duration_ms) / 1000.0
         )
+
+        sink = progress.sink
+        sink_rows = (
+            sink.get("numOutputRows")
+            if isinstance(sink, dict)
+            else getattr(sink, "numOutputRows", None)
+        )
+        # ForeachBatch reports -1 because Spark cannot inspect its output;
+        # numInputRows is the faithful DLQ fallback. Native Iceberg reports
+        # the committed output row count here.
+        if sink_rows is None or int(sink_rows) < 0:
+            sink_rows = progress.numInputRows
+        row_count = max(0, int(sink_rows))
+        ROWS_WRITTEN.labels(table=query_name).inc(row_count)
+
+        if query_name == "dlq":
+            DLQ_RECORDS.inc(row_count)
+        elif query_name == "late_arrivals":
+            LATE_ARRIVALS.inc(row_count)
+
+        event_time = progress.eventTime
+        max_event_time = (
+            event_time.get("max")
+            if isinstance(event_time, dict)
+            else getattr(event_time, "max", None)
+        )
+        if max_event_time:
+            newest = datetime.fromisoformat(max_event_time.replace("Z", "+00:00"))
+            if newest.tzinfo is None:
+                newest = newest.replace(tzinfo=UTC)
+            with latest_event_lock:
+                if latest_event_time is None or newest > latest_event_time:
+                    latest_event_time = newest
 
     def onQueryTerminated(self, event) -> None:  # noqa: N802 - Spark callback API
         return None
@@ -210,63 +247,27 @@ def parsed_records(raw: DataFrame) -> tuple[DataFrame, DataFrame]:
     return valid, invalid
 
 
-def write_iceberg(table: str, count_late: bool = False):
-    """Return a foreachBatch writer with metrics after a successful append."""
-
-    def writer(batch: DataFrame, _: int) -> None:
-        global latest_event_time
-        batch.cache()
-        try:
-            row_count = batch.count()
-            if row_count:
-                batch.writeTo(table).append()
-                ROWS_WRITTEN.labels(table=table).inc(row_count)
-                if count_late:
-                    late_events = batch.agg(
-                        F.coalesce(F.sum("late_event_count"), F.lit(0)).alias("count")
-                    ).first()["count"]
-                    LATE_ARRIVALS.inc(int(late_events))
-                if "event_time" in batch.columns:
-                    newest = batch.agg(F.max("event_time").alias("newest")).first()["newest"]
-                    if newest is not None:
-                        if newest.tzinfo is None:
-                            newest = newest.replace(tzinfo=UTC)
-                        with latest_event_lock:
-                            if latest_event_time is None or newest > latest_event_time:
-                                latest_event_time = newest
-        finally:
-            batch.unpersist()
-
-    return writer
-
-
 def write_dlq(batch: DataFrame, _: int) -> None:
-    batch.cache()
-    try:
-        row_count = batch.count()
-        if row_count:
-            payload = batch.select(
-                F.to_json(F.struct("reason", "raw_json", "ingested_at")).cast("string").alias("value")
-            )
-            (
-                payload.write.format("kafka")
-                .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
-                .option("topic", DLQ_TOPIC)
-                .save()
-            )
-            DLQ_RECORDS.inc(row_count)
-    finally:
-        batch.unpersist()
+    """Write the DLQ at-least-once; its metrics come from the query listener."""
+    payload = batch.select(
+        F.to_json(F.struct("reason", "raw_json", "ingested_at")).cast("string").alias("value")
+    )
+    (
+        payload.write.format("kafka")
+        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
+        .option("topic", DLQ_TOPIC)
+        .save()
+    )
 
 
-def stream_to_iceberg(frame: DataFrame, table: str, checkpoint: str, *, late: bool = False):
+def stream_to_iceberg(frame: DataFrame, table: str, checkpoint: str):
     return (
         frame.writeStream.queryName(table.rsplit(".", 1)[-1])
+        .format("iceberg")
         .outputMode("append")
         .option("checkpointLocation", f"{CHECKPOINT_ROOT}/{checkpoint}")
         .trigger(processingTime=TRIGGER)
-        .foreachBatch(write_iceberg(table, count_late=late))
-        .start()
+        .toTable(table)
     )
 
 
@@ -349,7 +350,7 @@ def main() -> None:
             stream_to_iceberg(edits, "local.gold.edits_per_minute_by_wiki", "gold-edits"),
             stream_to_iceberg(bots, "local.gold.bot_vs_human_per_minute", "gold-bots"),
             stream_to_iceberg(top_pages, "local.gold.top_pages_10min", "gold-pages"),
-            stream_to_iceberg(late, "local.gold.late_arrivals", "gold-late", late=True),
+            stream_to_iceberg(late, "local.gold.late_arrivals", "gold-late"),
         ]
     )
     spark.streams.awaitAnyTermination()
