@@ -2,7 +2,7 @@
 
 Real-time pipeline over the live Wikimedia recent-changes firehose — **SSE → Redpanda → Spark Structured Streaming → Iceberg on MinIO → Grafana** — the whole thing runs on a laptop with one command.
 
-**Live write-up & interactive demo:** [portfolio-site-eosin-eta.vercel.app/projects/real-time-wikipedia-edits-pipeline](https://portfolio-site-eosin-eta.vercel.app/projects/real-time-wikipedia-edits-pipeline)
+**Live write-up & interactive demo:** [gokularumugam-portfolio-site.vercel.app/projects/real-time-wikipedia-edits-pipeline](https://gokularumugam-portfolio-site.vercel.app/projects/real-time-wikipedia-edits-pipeline)
 
 ![Grafana dashboard](docs/img/grafana-dashboard.png)
 
